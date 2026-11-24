@@ -44,6 +44,7 @@ import {
   getOpenOffers,
   getPendingTransactions,
   getClaimableBalances,
+  getClaimableBalancesForClaimant,
   getLiquidityPool,
   liquidityPoolDeposit,
   liquidityPoolWithdraw,
@@ -300,6 +301,7 @@ export default function App() {
   });
   const [claimableBalances, setClaimableBalances] = useState([]);
   const [claimableResult, setClaimableResult] = useState(null);
+  const [claimableToClaim, setClaimableToClaim] = useState([]);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
   const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
@@ -573,6 +575,9 @@ export default function App() {
       setHorizonNotice(null);
       const claimables = await getClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(claimables);
+      getClaimableBalancesForClaimant(publicKey)
+        .then((rows) => setClaimableToClaim(rows))
+        .catch(() => setClaimableToClaim([]));
       try {
         const details = await getAccountDetails(publicKey, { signal });
         const latestLedger = await fetchLatestHorizonLedger(
@@ -3525,6 +3530,43 @@ export default function App() {
                   ))}
                 </div>
               )}
+
+              <div className="section">
+                <h3 className="subhead">Claimable balances you can claim</h3>
+                {claimableToClaim.length > 0 ? (
+                  <ul className="balance-list">
+                    {claimableToClaim.map((balance) => (
+                      <li key={balance.id} className="balance-row">
+                        <div>
+                          <strong>{balance.amount} {balance.asset}</strong>
+                          {balance.claimStatus === "not-yet" ? (
+                            <span className="muted">
+                              Not yet claimable — opens{" "}
+                              {new Date(balance.claimOpensAt).toLocaleString()}
+                            </span>
+                          ) : balance.claimStatus === "claimable" ? (
+                            <span className="muted">Claimable now</span>
+                          ) : (
+                            <span className="muted">Claim status unknown</span>
+                          )}
+                        </div>
+                        {balance.claimStatus === "claimable" && (
+                          <button
+                            className="btn btn--primary btn--sm"
+                            type="button"
+                            onClick={() => handleClaimClaimable(balance)}
+                            disabled={loading === `claimable-${balance.id}`}
+                          >
+                            {loading === `claimable-${balance.id}` ? "Claiming…" : "Claim"}
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No claimable balances you can claim.</p>
+                )}
+              </div>
 
               <div className="section">
                 <h3 className="subhead">Claimable balances you created</h3>
