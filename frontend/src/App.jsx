@@ -59,6 +59,7 @@ import {
   getTransactionMemos,
   buildPaymentsCsv,
   PAYMENTS_CSV_FILENAME,
+  getAccountMergeBlockers,
 } from "./stellar";
 import { downloadCsv } from "./csvExport";
 import {
@@ -240,6 +241,26 @@ export default function App() {
     destination: "",
     startingBalance: "",
   });
+  const [mergeForm, setMergeForm] = useState({ destination: "", retypeDestination: "" });
+  const [mergeBlockers, setMergeBlockers] = useState([]);
+
+  useEffect(() => {
+    if (!publicKey) {
+      setMergeBlockers([]);
+      return;
+    }
+    let cancelled = false;
+    getAccountMergeBlockers(publicKey)
+      .then((blockers) => {
+        if (!cancelled) setMergeBlockers(blockers);
+      })
+      .catch(() => {
+        if (!cancelled) setMergeBlockers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [publicKey]);
   const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
   const [reserveError, setReserveError] = useState(null);
   const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
@@ -712,6 +733,13 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading("merge");
     try {
+      const blockers = await getAccountMergeBlockers(publicKey);
+      setMergeBlockers(blockers);
+      if (blockers.length > 0) {
+        showToast(`Cannot merge account: ${blockers.join("; ")}`, "error");
+        setLoading("");
+        return;
+      }
       const result = await mergeAccountWithFreighter(
         publicKey,
         mergeForm.destination,
@@ -727,6 +755,7 @@ export default function App() {
       setTransactions([]);
       setAccountDetails(null);
       setMergeForm({ destination: "", retypeDestination: "" });
+      setMergeBlockers([]);
     } catch (err) {
       showToast(err.message || "Account merge failed.", "error");
     } finally {
@@ -3218,6 +3247,69 @@ export default function App() {
                       )}
                     </button>
                   </div>
+                  <form className="form" onSubmit={handleMergeAccount} style={{ marginTop: 16 }}>
+                    <h3 className="subhead">Merge account</h3>
+                    <p className="muted">
+                      Send all XLM to another account and close this one. The account can only be
+                      merged once it has no trustlines, offers, data entries, or created claimable
+                      balances.
+                    </p>
+                    {mergeBlockers.length > 0 && (
+                      <div className="info-box info-box--warning" role="alert">
+                        <span className="eyebrow">Merge blocked</span>
+                        <ul>
+                          {mergeBlockers.map((blocker) => (
+                            <li key={blocker}>{blocker}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <label className="label" htmlFor="merge-destination">
+                      Destination public key
+                    </label>
+                    <input
+                      id="merge-destination"
+                      className="input"
+                      value={mergeForm.destination}
+                      onChange={(e) =>
+                        setMergeForm((prev) => ({
+                          ...prev,
+                          destination: e.target.value,
+                        }))
+                      }
+                      placeholder="G..."
+                      required
+                    />
+                    <label className="label" htmlFor="merge-retype">
+                      Retype destination public key
+                    </label>
+                    <input
+                      id="merge-retype"
+                      className="input"
+                      value={mergeForm.retypeDestination}
+                      onChange={(e) =>
+                        setMergeForm((prev) => ({
+                          ...prev,
+                          retypeDestination: e.target.value,
+                        }))
+                      }
+                      placeholder="G..."
+                      required
+                    />
+                    <button
+                      className="btn btn--primary"
+                      type="submit"
+                      disabled={loading === "merge" || mergeBlockers.length > 0}
+                    >
+                      {loading === "merge" ? (
+                        <>
+                          <Spinner /> Merging…
+                        </>
+                      ) : (
+                        "Merge account"
+                      )}
+                    </button>
+                  </form>
                 </>
               )}
             </div>
