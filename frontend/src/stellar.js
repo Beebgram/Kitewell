@@ -8,7 +8,7 @@ import {
   isFriendbotAvailable,
   NETWORKS,
 } from "./network";
-import { calculateMinimumBalance } from "./accountReserve";
+import { mapTransactionFee } from "./historyFee";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -26,6 +26,94 @@ const horizon429BackoffByNetwork = new Map();
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
+}
+
+/** @param {unknown} error */
+export function isHorizon429(error) {
+  const status = error?.response?.status ?? error?.status;
+  if (status === 429) return true;
+  return /too many requests/i.test(String(error?.message ?? ""));
+}
+
+export function isHorizonSlowdownError(error) {
+  return error instanceof Error && error.message === HORIZON_SLOWDOWN_MESSAGE;
+}
+
+function readRetryAfterSeconds(error) {
+  const headers = error?.response?.headers;
+  if (!headers) return null;
+  const raw =
+    typeof headers.get === "function"
+      ? headers.get("retry-after") ?? headers.get("Retry-After")
+      : headers["retry-after"] ?? headers["Retry-After"];
+  if (raw == null || raw === "") return null;
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber) && asNumber >= 0) return asNumber;
+  const asDate = Date.parse(String(raw));
+  if (!Number.isNaN(asDate)) return Math.max(0, (asDate - Date.now()) / 1000);
+  return null;
+}
+
+export function computeHorizon429WaitSeconds(streak) {
+  const safeStreak = Math.max(1, streak);
+  return Math.min(HORIZON_429_BASE_WAIT_SEC * 2 ** (safeStreak - 1), HORIZON_429_MAX_WAIT_SEC);
+}
+
+function resetHorizon429Backoff(networkId = getActiveNetworkId()) {
+  horizon429BackoffByNetwork.delete(networkId);
+}
+
+export function recordHorizon429(error) {
+  const networkId = getActiveNetworkId();
+  const prior = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  const streak = prior.streak + 1;
+  horizon429BackoffByNetwork.set(networkId, { streak });
+  const retryAfter = readRetryAfterSeconds(error);
+  if (retryAfter != null) return retryAfter;
+  return computeHorizon429WaitSeconds(streak);
+}
+
+export function resetHorizon429BackoffForTests() {
+  horizon429BackoffByNetwork.clear();
+}
+
+function abortError() {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function withHorizon429Backoff(fn, options = {}) {
+  const { signal, sleep = defaultSleep } = options;
+  if (signal?.aborted) throw abortError();
+  try {
+    const result = await fn();
+    resetHorizon429Backoff();
+    return result;
+  } catch (error) {
+    if (!isHorizon429(error)) throw error;
+    const waitSeconds = recordHorizon429(error);
+    await sleep(waitSeconds * 1000, signal);
+    throw new Error(HORIZON_SLOWDOWN_MESSAGE, { cause: error });
+  }
 }
 
 export async function getLatestLedger(networkId = getActiveNetworkId()) {
@@ -110,6 +198,14 @@ export async function getFeeStats() {
 }
 
 export const MAX_ASSET_CODE_LENGTH = 12;
+function mapOrderBookRows(rows = []) {
+  return rows.slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
+}
+
 export const MAX_DATA_NAME_BYTES = 64;
 export const MAX_DATA_VALUE_BYTES = 64;
 
@@ -134,28 +230,38 @@ export function validateDataValue(value) {
   return normalized;
 }
 
-export function formatDataValue(value) {
-  if (value == null) return "";
-
-  let bytes;
+function dataValueBytes(value) {
+  if (value == null) return new Uint8Array();
   if (typeof value === "string") {
     try {
       const binary = atob(value);
-      bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      return Uint8Array.from(binary, (char) => char.charCodeAt(0));
     } catch {
-      bytes = new TextEncoder().encode(value);
+      return new TextEncoder().encode(value);
     }
-  } else if (value instanceof Uint8Array) {
-    bytes = value;
-  } else {
-    bytes = new TextEncoder().encode(String(value));
   }
+  if (value instanceof Uint8Array) return value;
+  return new TextEncoder().encode(String(value));
+}
 
+function decodeUtf8(bytes) {
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), isBinary: false };
   } catch {
-    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return {
+      text: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      isBinary: true,
+    };
   }
+}
+
+export function formatDataValue(value) {
+  return decodeUtf8(dataValueBytes(value)).text;
+}
+
+/** True when the value is not valid UTF-8 and is therefore shown as hex. */
+export function isBinaryDataValue(value) {
+  return decodeUtf8(dataValueBytes(value)).isBinary;
 }
 
 export function mapAccountDataEntries(account) {
@@ -179,6 +285,7 @@ export function mapAccountDataEntries(account) {
 
 export const getAccountDataEntries = mapAccountDataEntries;
 export const formatAccountDataValue = formatDataValue;
+export const isBinaryAccountDataValue = isBinaryDataValue;
 export const validateManageDataName = validateDataName;
 export const validateManageDataValue = validateDataValue;
 
@@ -596,16 +703,6 @@ export function calculateAvailableBalance(
   return Math.max(0, total - sellingLiabilities).toFixed(7);
 }
 
-function liabilityFields(balance, isNative, subentryCount, baseReserve) {
-  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
-  const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
-  return {
-    sellingLiabilities: sellingLiabilities.toFixed(7),
-    buyingLiabilities: buyingLiabilities.toFixed(7),
-    available: calculateAvailableBalance(balance, isNative, subentryCount, baseReserve),
-  };
-}
-
 /**
  * Hide only idle, zero-balance credit trustlines. Native XLM, pool shares and
  * trustlines with either buying or selling liabilities always remain visible.
@@ -639,8 +736,7 @@ async function readBaseReserve() {
   return baseReserve;
 }
 
-function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count || 0;
+function mapHorizonBalances(account) {
   return account.balances.map((b) => {
     const sellingLiabilities = b.selling_liabilities ?? "0";
     const buyingLiabilities = b.buying_liabilities ?? "0";
@@ -753,7 +849,6 @@ export async function getAccountDetails(publicKey) {
     subentryCount: account.subentry_count,
     lastModifiedLedger: account.last_modified_ledger ?? null,
     thresholds: account.thresholds,
-    signers: account.signers,
     balances: mapHorizonBalances(account),
     dataEntries: mapAccountDataEntries(account),
     signers: account.signers || [],
@@ -871,7 +966,7 @@ export async function getBalance(publicKey, options = {}) {
   return xlm ? xlm.balance : "0";
 }
 
-export async function getClaimableBalances(publicKey) {
+export async function getClaimableBalancesForClaimant(publicKey) {
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
   }
@@ -897,7 +992,7 @@ export async function getClaimableBalances(publicKey) {
   }));
 }
 
-export const listClaimableBalances = getClaimableBalances;
+export const listClaimableBalances = getClaimableBalancesForClaimant;
 
 /**
  * Load one liquidity pool (both reserves and total shares) from Horizon.
@@ -1161,6 +1256,12 @@ export function mapPendingTransaction(record) {
   };
 }
 
+export function selectPendingTransactions(records) {
+  return (records || [])
+    .map(mapPendingTransaction)
+    .filter((tx) => tx.hash && tx.status !== "applied");
+}
+
 /**
  * Load one page of trades for an account.
  *
@@ -1280,39 +1381,19 @@ export async function getPendingTransactions(publicKey, options = {}) {
     const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
       publicKey
     )}/pending_transactions`;
-
-  let builder = getServer()
-    .trades()
-    .forAccount(publicKey)
-    .limit(limit)
-    .order("desc");
-
-  if (cursor) {
-    builder = builder.cursor(cursor);
-  }
-
-  const response = await builder.call();
-
-  return {
-    records: response.records.map((trade) => ({
-      id: trade.id,
-      ledger_close_time: trade.ledger_close_time,
-      offer_id: trade.offer_id,
-      base_account: trade.base_account,
-      base_amount: trade.base_amount,
-      base_asset_type: trade.base_asset_type,
-      base_asset_code: trade.base_asset_code,
-      base_asset_issuer: trade.base_asset_issuer,
-      counter_account: trade.counter_account,
-      counter_amount: trade.counter_amount,
-      counter_asset_type: trade.counter_asset_type,
-      counter_asset_code: trade.counter_asset_code,
-      counter_asset_issuer: trade.counter_asset_issuer,
-      price: trade.price,
-      base_is_seller: trade.base_is_seller,
-    })),
-    nextCursor: response.records.length > 0 
-      ? response.records[response.records.length - 1].paging_token 
-      : null,
-  };
+    const response = options.signal
+      ? await fetch(url, { signal: options.signal })
+      : await fetch(url);
+    if (response.status === 404) return [];
+    if (!response.ok) {
+      const error = new Error(`Could not load pending transactions (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    const body = await response.json();
+    const records = Array.isArray(body)
+      ? body
+      : body?._embedded?.records || body?.records || [];
+    return selectPendingTransactions(records);
+  }, options);
 }

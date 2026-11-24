@@ -59,6 +59,8 @@ import {
   getTransactionMemos,
   buildPaymentsCsv,
   PAYMENTS_CSV_FILENAME,
+  formatDataValue,
+  isBinaryDataValue,
 } from "./stellar";
 import { downloadCsv } from "./csvExport";
 import {
@@ -2553,6 +2555,14 @@ export default function App() {
     );
   };
 
+  const copyDataValue = async (value) => {
+    const result = await copyToClipboardResult(formatDataValue(value));
+    showToast(
+      result.ok ? "Data value copied." : "Could not copy — select the value manually.",
+      result.ok ? "success" : "error"
+    );
+  };
+
   const handleDeploy = async () => {
     if (activeNetwork.id !== "TESTNET") {
       return showToast("Contract deploy is Testnet-only.", "error");
@@ -3183,6 +3193,41 @@ export default function App() {
                             {accountDetails.thresholds?.high_threshold ?? "—"}
                           </span>
                         </div>
+                      </div>
+                      <div className="metadata-grid" style={{ marginTop: 12 }}>
+                        <span className="metadata-label">Data entries</span>
+                        {accountDetails.dataEntries?.length > 0 ? (
+                          accountDetails.dataEntries.map((entry) => {
+                            const isBinary = isBinaryDataValue(entry.value);
+                            const text = formatDataValue(entry.value);
+                            return (
+                              <div key={entry.name} className="data-entry-row">
+                                <span className="data-entry-name" style={{ width: "40%" }}>
+                                  {entry.name}
+                                </span>
+                                <span className="data-entry-value" style={{ width: "60%" }}>
+                                  {isBinary && (
+                                    <span className="data-entry-binary">Binary (hex)</span>
+                                  )}
+                                  {text}
+                                  {text && (
+                                    <button
+                                      type="button"
+                                      className="btn btn--ghost btn--sm"
+                                      onClick={() => copyDataValue(entry.value)}
+                                    >
+                                      Copy
+                                    </button>
+                                  )}
+                                </span>
+                              </div>
+                            );
+                          })
+                        ) : (
+                          <span className="muted" style={{ width: "60%" }}>
+                            No data entries
+                          </span>
+                        )}
                       </div>
                       <p className="muted" role="status" style={{ marginTop: 8 }}>
                         {accountDetails.ledgerStatus?.message ?? "Ledger age unknown."}
